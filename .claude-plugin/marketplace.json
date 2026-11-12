@@ -1,0 +1,12 @@
+{
+  "name": "workhack-context-storage",
+  "description": "Общая память WorkHack в Cloudflare R2",
+  "owner": { "name": "WorkHack" },
+  "plugins": [
+    {
+      "name": "workhack-context",
+      "source": "./",
+      "description": "Общая память WorkHack в R2: хуки старта/финиша сессии и скилл workhack."
+    }
+  ]
+}

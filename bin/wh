@@ -1,0 +1,4 @@
+#!/bin/sh
+d=$(cd "$(dirname "$0")" && pwd)
+if command -v python3 >/dev/null 2>&1; then exec python3 "$d/wh.py" "$@"; fi
+exec python "$d/wh.py" "$@"

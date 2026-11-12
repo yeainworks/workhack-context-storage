@@ -1,0 +1,6 @@
+{
+  "name": "workhack-context",
+  "version": "1.0.0",
+  "description": "Общая память WorkHack в Cloudflare R2: контекст на старте сессии, обязательная запись итога в конце, чекпоинт перед сжатием.",
+  "author": { "name": "WorkHack" }
+}
