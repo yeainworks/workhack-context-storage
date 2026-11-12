@@ -34,6 +34,9 @@ from pathlib import Path
 HOME = Path(os.environ.get("WH_HOME") or Path.home() / ".workhack")
 EVENT_KINDS = ("claim", "done", "handoff", "fail", "note", "start", "session-end", "report", "checkpoint")
 CLOSING = ("done", "handoff", "fail", "note")   # любое из них = «итог записан»
+LOG_MODES = ("full", "prompts", "off")  # full: сообщения пользователя и ответы ИИ; prompts: только пользователь
+MSG_LIMIT = 4000                        # символов на одно сообщение в журнале
+CONFIG_KEYS = {"log_messages": LOG_MODES, "who": None}   # что можно менять командой wh config (None = любое имя)
 CLAIM_TTL_MIN = 90
 UTC = datetime.timezone.utc
 
@@ -180,7 +183,7 @@ class S3:
 
 ENV_MAP = {"WH_ACCOUNT_ID": "account_id", "WH_BUCKET": "bucket", "WH_JURISDICTION": "jurisdiction",
            "WH_WHO": "who", "WH_ENDPOINT": "endpoint", "WH_ACCESS_KEY_ID": "access_key_id",
-           "WH_SECRET_ACCESS_KEY": "secret_access_key"}
+           "WH_SECRET_ACCESS_KEY": "secret_access_key", "WH_LOG_MESSAGES": "log_messages"}
 
 
 def _read_json(path):
@@ -274,16 +277,58 @@ def record(kind, msg="", task="", files=(), suffix=""):
     key, body = event_key(ev, now), json.dumps(ev, ensure_ascii=False)
     if kind in CLOSING:
         _atomic_write(HOME / "last_close", repr(time.time()))
+    marker = (lambda s3: s3.put("done/%s.json" % task, body.encode("utf-8"), if_none_match=True)) \
+        if kind == "done" and task else None
+    return _deliver(cfg, key, body, marker)
+
+
+def _deliver(cfg, key, body, after=None):
+    """Кладёт объект в бакет. Нет связи или настроек: в локальную очередь. -> ('ok'|'queued', подробности)"""
     try:
         s3 = client(cfg)
         s3.put(key, body.encode("utf-8"), if_none_match=True)
-        if kind == "done" and task:
-            s3.put("done/%s.json" % task, body.encode("utf-8"), if_none_match=True)
+        if after:
+            after(s3)
         flush_outbox(s3)
         return "ok", key
     except (ConfigError, NetError) as e:
         queue_event(key, body)
         return "queued", "%s (%s)" % (key, e)
+
+
+def record_message(role, text, session):
+    """Журнал сообщений: messages/ГГГГ-ММ-ДД/…json. Режим: full (всё), prompts (только пользователь), off."""
+    cfg = settings()
+    mode = cfg.get("log_messages") if cfg.get("log_messages") in LOG_MODES else "full"
+    if mode == "off" or (mode == "prompts" and role != "user") or not (text or "").strip():
+        return
+    now = datetime.datetime.now(UTC)
+    msg = {"v": 1, "ts": now.isoformat(timespec="seconds"), "who": cfg["who"], "role": role,
+           "session": session or "", "text": scrub(text.strip())[:MSG_LIMIT]}
+    key = "messages/%s/%s-%s-%s-%s.json" % (now.strftime("%Y-%m-%d"), now.strftime("%H%M%S"),
+                                             re.sub(r"[^\w+.-]", "_", cfg["who"]), role, secrets.token_hex(3))
+    _deliver(cfg, key, json.dumps(msg, ensure_ascii=False))
+
+
+def last_assistant_text(path):
+    """Последний ответ ИИ (только текст) из транскрипта Claude Code (jsonl). Читает хвост файла."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 2_000_000))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except (OSError, TypeError):
+        return ""
+    for line in reversed(lines):
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if obj.get("type") == "assistant":
+            parts = [c.get("text", "") for c in obj.get("message", {}).get("content", []) if isinstance(c, dict) and c.get("type") == "text"]
+            if any(p.strip() for p in parts):
+                return "\n".join(parts)
+    return ""
 
 
 def _age_min(ts):
@@ -336,13 +381,28 @@ def cached_context():
     return {str(p.relative_to(cache)): p.read_text(encoding="utf-8") for p in sorted(cache.rglob("*")) if p.is_file()}
 
 
-def recent_events(s3, limit=15):
+def _recent_keys(s3, root, limit):
     today = datetime.datetime.now(UTC)
     keys = []
     for d in (today - datetime.timedelta(days=1), today):
-        keys += s3.list("events/%s/" % d.strftime("%Y-%m-%d"))
+        keys += s3.list("%s/%s/" % (root, d.strftime("%Y-%m-%d")))
+    return sorted(keys)[-limit:]
+
+
+def recent_messages(s3, limit=6):
     lines = []
-    for key in sorted(keys)[-limit:]:
+    for key in _recent_keys(s3, "messages", limit):
+        got = s3.get(key)
+        m = _read_json_bytes(got[0]) if got else {}
+        if m:
+            lines.append("- %s %s (%s): %s" % (m.get("ts", "")[5:16].replace("T", " "), m.get("who"), m.get("role"),
+                                              " ".join(m.get("text", "").split())[:220]))
+    return lines
+
+
+def recent_events(s3, limit=15):
+    lines = []
+    for key in _recent_keys(s3, "events", limit):
         got = s3.get(key)
         ev = _read_json_bytes(got[0]) if got else {}
         if ev:
@@ -371,6 +431,7 @@ def build_digest(s3):
     if others:
         parts += ["", "## Другие файлы контекста (читай по теме: wh get context/<имя> -)"] + ["- " + n for n in others]
     parts += ["", "## Последние события"] + (recent_events(s3) or ["- (пока нет)"])
+    parts += ["", "## Последние сообщения (журнал переписки, чтобы продолжить с места остановки)"] + (recent_messages(s3) or ["- (пока нет)"])
     parts += ["", "## Заняты сейчас (claim)"] + (active_claims(s3) or ["- (никто)"])
     parts += ["", "## Правило сессии", "Закончил работу: wh done \"что сделано + ссылки на файлы\" (или wh handoff / wh fail / wh note). Без записи итога сессию закрыть нельзя."]
     return "\n".join(parts)
@@ -547,7 +608,20 @@ def cmd_pack(_):
     return 0
 
 
-BLOCK_BEGIN, BLOCK_END = "<!-- wh:begin -->", "<!-- wh:end -->"
+def cmd_config(a):
+    if a.key not in CONFIG_KEYS or (CONFIG_KEYS[a.key] and a.value not in CONFIG_KEYS[a.key]) \
+            or not re.fullmatch(r"[\w.-]+", a.value):
+        allowed = {k: (list(v) if v else "любое имя") for k, v in CONFIG_KEYS.items()}
+        print("можно менять только: %s" % allowed)
+        return 1
+    cfg = _read_json(HOME / "config.json")
+    cfg[a.key] = a.value
+    _atomic_write(HOME / "config.json", json.dumps(cfg, indent=2, ensure_ascii=False))
+    print("%s = %s" % (a.key, a.value))
+    return 0
+
+
+BLOCK_BEGIN, BLOCK_END ="<!-- wh:begin -->", "<!-- wh:end -->"
 AGENT_BLOCK = """%s
 ## Общая память WorkHack (обязательно, действует всегда)
 1. Первое действие сессии: `wh start`, прочитать вывод целиком (в Claude Code это делает хук сам).
@@ -615,7 +689,24 @@ def _closed_since(started):
     return last.exists() and float(last.read_text()) >= started
 
 
+def hook_prompt(p):
+    record_message("user", p.get("prompt", ""), p.get("session_id"))
+
+
+def _journal_reply(p):
+    text = last_assistant_text(p.get("transcript_path"))
+    seen = HOME / "sessions" / ("%s.lastreply" % re.sub(r"[^\w.-]", "_", p.get("session_id") or "x"))
+    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()
+    if text and (not seen.exists() or seen.read_text() != digest):  # Stop срабатывает дважды при блокировке
+        record_message("assistant", text, p.get("session_id"))
+        _atomic_write(seen, digest)
+
+
 def hook_stop(p):
+    try:
+        _journal_reply(p)
+    except Exception:  # журнал не должен мешать проверке итога
+        pass
     m = _marker(p.get("session_id"))
     if p.get("stop_hook_active") or not m.exists() or _closed_since(float(m.read_text())):
         return
@@ -637,7 +728,7 @@ def hook_end(p):
         m.unlink()
 
 
-HOOKS = {"start": hook_start, "stop": hook_stop, "precompact": hook_precompact, "end": hook_end}
+HOOKS = {"start": hook_start, "prompt": hook_prompt, "stop": hook_stop, "precompact": hook_precompact, "end": hook_end}
 
 
 def cmd_hook(a):
@@ -690,6 +781,9 @@ def build_parser():
     ig.add_argument("file", nargs="?")
     ig.add_argument("--from", dest="source", default="chat")
     ig.add_argument("--task", default="")
+    cf = add("config", cmd_config, "изменить настройку: wh config log_messages full|prompts|off")
+    cf.add_argument("key")
+    cf.add_argument("value")
     add("init-project", cmd_init_project, "подключить папку проекта: маркер + правила в CLAUDE.md/AGENTS.md").add_argument("dir")
     add("hook", cmd_hook, "служебное: вызов из хуков Claude Code").add_argument("name", choices=sorted(HOOKS))
     return ap

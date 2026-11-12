@@ -310,6 +310,88 @@ class TestHooks(Base):
         self.assertEqual(json.loads(MockS3.store[k])["kind"], "checkpoint")
 
 
+class TestMessageJournal(TestHooks):
+    """Каждое сообщение пользователя и ответ ИИ уходят в messages/ (отдельно от events/)."""
+
+    def transcript(self, *replies):
+        p = Path(self.tmp.name) / "t.jsonl"
+        lines = [json.dumps({"type": "user", "message": {"role": "user", "content": "вопрос"}})]
+        for r in replies:
+            lines.append(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "name": "Bash", "input": {}}, {"type": "text", "text": r}]}}))
+        p.write_text("\n".join(lines), encoding="utf-8")
+        return str(p)
+
+    def messages(self):
+        return [json.loads(MockS3.store[k]) for k in self.keys("messages/")]
+
+    def test_prompt_hook_journals_user_message_scrubbed_and_prints_nothing(self):
+        code, out = self.hook("prompt", session_id="s", cwd=self.project(), prompt="сделай пост token=abc123def456ghi789")
+        self.assertEqual((code, out), (0, ""))
+        (m,) = self.messages()
+        self.assertEqual((m["role"], m["session"]), ("user", "s"))
+        self.assertIn("сделай пост", m["text"])
+        self.assertNotIn("abc123def456ghi789", m["text"])
+
+    def test_stop_journals_last_assistant_text_once_even_when_it_blocks_then_allows(self):
+        cwd, tp = self.project(), self.transcript("первый ответ", "итоговый ответ")
+        self.hook("start", session_id="s", cwd=cwd)
+        self.hook("stop", session_id="s", cwd=cwd, stop_hook_active=False, transcript_path=tp)   # блокирует
+        self.hook("stop", session_id="s", cwd=cwd, stop_hook_active=True, transcript_path=tp)    # разрешает
+        got = self.messages()
+        self.assertEqual([(m["role"], m["text"]) for m in got], [("assistant", "итоговый ответ")])
+
+    def test_modes_prompts_only_and_off(self):
+        cwd, tp = self.project(), self.transcript("ответ")
+        os.environ["WH_LOG_MESSAGES"] = "prompts"
+        try:
+            self.hook("prompt", session_id="s", cwd=cwd, prompt="вопрос")
+            self.hook("stop", session_id="s", cwd=cwd, stop_hook_active=True, transcript_path=tp)
+            self.assertEqual([m["role"] for m in self.messages()], ["user"])
+            os.environ["WH_LOG_MESSAGES"] = "off"
+            self.hook("prompt", session_id="s", cwd=cwd, prompt="ещё вопрос")
+            self.assertEqual(len(self.messages()), 1)
+        finally:
+            os.environ.pop("WH_LOG_MESSAGES")
+
+    def test_message_is_queued_offline_and_start_digest_shows_recent_messages(self):
+        cwd = self.project()
+        os.environ["WH_ENDPOINT"] = "http://127.0.0.1:1"
+        self.hook("prompt", session_id="s", cwd=cwd, prompt="сообщение без сети")
+        self.assertEqual(self.keys("messages/"), [])
+        os.environ["WH_ENDPOINT"] = self.env["WH_ENDPOINT"]
+        self.run_wh("flush")
+        code, out = self.run_wh("start")
+        self.assertIn("Последние сообщения", out)
+        self.assertIn("сообщение без сети", out)
+
+    def test_config_command_accepts_only_known_keys(self):
+        self.assertEqual(self.run_wh("config", "log_messages", "prompts")[0], 0)
+        self.assertEqual(json.loads((wh.HOME / "config.json").read_text())["log_messages"], "prompts")
+        self.assertEqual(self.run_wh("config", "log_messages", "всё-подряд")[0], 1)
+        self.assertEqual(self.run_wh("config", "secret_access_key", "x")[0], 1)
+
+
+class TestWhCodex(Base):
+    def test_wrapper_injects_context_into_codex_prompt_and_logs_session_end(self):
+        import subprocess
+        fake = Path(self.tmp.name) / "fakebin"
+        fake.mkdir()
+        out_file = Path(self.tmp.name) / "codex_args.txt"
+        (fake / "codex").write_text('#!/bin/sh\nprintf "%s" "$*" > "' + str(out_file) + '"\n', encoding="utf-8")
+        (fake / "codex").chmod(0o755)
+        MockS3.store["context/core.md"] = "КОР-ДЛЯ-КОДЕКС".encode()
+        env = dict(os.environ, PATH=str(fake) + os.pathsep + os.environ["PATH"])
+        root = Path(__file__).resolve().parent.parent / "bin"
+        res = subprocess.run([str(root / "wh-codex"), "сделай пост"], env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        sent = out_file.read_text(encoding="utf-8")
+        self.assertIn("КОР-ДЛЯ-КОДЕКС", sent)
+        self.assertIn("сделай пост", sent)
+        kinds = [json.loads(MockS3.store[k])["kind"] for k in self.keys("events/")]
+        self.assertEqual(kinds, ["session-end"])
+
+
 class TestInitProject(Base):
     def test_init_project_is_idempotent_and_keeps_existing_text(self):
         d = Path(self.tmp.name) / "wp"
